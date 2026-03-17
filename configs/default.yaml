@@ -1,0 +1,62 @@
+# ============================================================
+# QueryRewrite — Default Configuration
+# ============================================================
+
+project:
+  name: "query_rewrite"
+  seed: 42
+
+# ----- Data --------------------------------------------------
+data:
+  train_path: "data/raw/train.jsonl"
+  val_path: "data/raw/val.jsonl"
+  test_path: "data/raw/test.jsonl"
+  max_query_length: 64
+  max_doc_length: 256
+
+# ----- Query Rewrite Model -----------------------------------
+rewrite_model:
+  base_model: "meta-llama/Llama-2-7b-hf"
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj"]
+
+# ----- Embedding Model ----------------------------------------
+embedding_model:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_dim: 384
+  pooling: "mean"            # mean | cls
+
+# ----- Alignment Loss -----------------------------------------
+alignment:
+  loss_type: "infonce"       # infonce | triplet | cosine
+  temperature: 0.07
+  margin: 0.2                # used when loss_type == triplet
+
+# ----- Retrieval -----------------------------------------------
+retrieval:
+  index_type: "flat_ip"     # flat_ip | ivf | hnsw
+  top_k: [1, 5, 10, 20, 50, 100]
+  nprobe: 10                # for IVF index
+
+# ----- Training -------------------------------------------------
+training:
+  epochs: 5
+  batch_size: 32
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 4
+  fp16: true
+  max_grad_norm: 1.0
+  save_steps: 500
+  eval_steps: 500
+  output_dir: "outputs/"
+  logging_dir: "outputs/logs/"
+
+# ----- Evaluation -----------------------------------------------
+evaluation:
+  metrics: ["recall", "ndcg", "mrr"]
+  k_values: [1, 5, 10, 20, 50, 100]

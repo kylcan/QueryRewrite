@@ -1,0 +1,20 @@
+# Core
+torch>=2.0
+transformers>=4.36
+peft>=0.7
+tokenizers>=0.15
+datasets>=2.16
+accelerate>=0.25
+
+# Embeddings
+sentence-transformers>=2.2
+
+# Retrieval
+faiss-cpu>=1.7
+
+# Config
+pyyaml>=6.0
+
+# Utilities
+numpy>=1.24
+tqdm>=4.65
