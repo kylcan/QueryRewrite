@@ -1,2 +1,9 @@
+queryRewrite/
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
 
-queryRewrite/lib/python3.12/site-packages/torch/
+# 忽略编译后的库文件（双重保险）
+*.dylib
+*.so
+*.dll

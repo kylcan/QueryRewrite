@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -115,33 +116,171 @@ def load_msmarco_subset(
 # 2. Query Rewrite — rule-based fallback + LLM path
 # ================================================================
 
-_REWRITE_RULES: List[Callable[[str], str]] = [
-    lambda q: q.replace("what is", "define"),
-    lambda q: q.replace("how to", "steps for"),
-    lambda q: q.replace("best", "top-rated"),
-    lambda q: q.replace("cheap", "budget-friendly"),
-    lambda q: "explain " + q if not q.startswith("explain") else q,
-    lambda q: q.rstrip("?").rstrip(".") + " overview",
-    lambda q: "guide: " + q,
-    lambda q: q + " tips and advice",
-]
+# --- Synonym / vocabulary expansion tables ---
+_SYNONYMS: Dict[str, List[str]] = {
+    "cost": ["price", "expense", "fee"],
+    "salary": ["pay", "compensation", "wage"],
+    "best": ["top", "greatest", "most popular"],
+    "cheap": ["affordable", "low-cost", "budget"],
+    "big": ["large", "substantial", "significant"],
+    "small": ["little", "minor", "compact"],
+    "fast": ["rapid", "quick", "speedy"],
+    "old": ["ancient", "historical", "aged"],
+    "new": ["recent", "modern", "latest"],
+    "important": ["significant", "crucial", "essential"],
+    "dangerous": ["hazardous", "risky", "harmful"],
+    "part": ["component", "element", "section"],
+    "type": ["kind", "category", "variety"],
+    "difference": ["distinction", "contrast", "variation"],
+}
+
+
+def _classify_intent(query: str) -> str:
+    """Classify a query into one of six intent categories."""
+    ql = query.lower().strip().rstrip("?").rstrip(".")
+
+    # Definition
+    if re.match(r"^(what is|what are|what does|what do|define|meaning of)\b", ql):
+        return "definition"
+    # Procedural / how-to
+    if re.match(r"^(how to|how do|how can|how does|how should|steps to)\b", ql):
+        return "procedural"
+    # Factual (who/where/when/which/how many/how much/how long/how far)
+    if re.match(r"^(where|when|who|which|how many|how much|how long|how far|how old)\b", ql):
+        return "factual"
+    # Yes/no
+    if re.match(r"^(is|are|do|does|did|can|could|will|would|was|were|has|have|should)\b", ql):
+        return "yesno"
+    # Comparison
+    if re.search(r"\b(vs\.?|versus|compared? to|difference between|similarities)\b", ql):
+        return "comparison"
+
+    return "general"
+
+
+def _expand_vocabulary(query: str) -> str:
+    """Add one synonym for the first matching keyword."""
+    ql = query.lower()
+    for word, syns in _SYNONYMS.items():
+        if re.search(rf"\b{word}\b", ql):
+            syn = random.choice(syns)
+            return f"{query} ({syn})"
+    return query
 
 
 def rule_based_rewrite(query: str) -> str:
-    """Apply 1–2 random transformation rules.
+    """Intent-aware query rewrite with vocabulary expansion.
 
-    Always produces a string that differs from the original so the
-    semantic gap between original query and rewrite is non-trivial.
+    1. Classify query intent (definition / procedural / factual / yesno /
+       comparison / general).
+    2. Apply an intent-specific structural transform that converts the
+       question form into a declarative/noun-phrase form closer to how
+       answer passages are written.
+    3. Optionally expand vocabulary with a domain synonym.
     """
-    q = query
-    n_rules = random.randint(1, 2)
-    chosen = random.sample(_REWRITE_RULES, min(n_rules, len(_REWRITE_RULES)))
-    for fn in chosen:
-        q = fn(q)
-    # Guarantee the rewrite differs
-    if q == query:
-        q = "detailed guide: " + query
+    q = query.strip().rstrip("?").rstrip(".")
+    intent = _classify_intent(query)
+
+    if intent == "definition":
+        # "what is X" → "X definition meaning"
+        core = re.sub(
+            r"^(what is|what are|what does|what do|define|meaning of)\s+",
+            "", q, flags=re.IGNORECASE,
+        ).strip()
+        q = f"{core} definition meaning"
+
+    elif intent == "procedural":
+        # "how to X" → "steps method procedure X"
+        core = re.sub(
+            r"^(how to|how do you|how do i|how can i|how can you|how does one|"
+            r"how do|how can|how does|how should i|how should|steps to)\s+",
+            "", q, flags=re.IGNORECASE,
+        ).strip()
+        q = f"{core} steps method procedure"
+
+    elif intent == "factual":
+        # "where is X" → "X location"  /  "when was X" → "X date year"
+        if re.match(r"^where\b", q, re.IGNORECASE):
+            core = re.sub(r"^where\s+(is|are|was|were|do|does)?\s*",
+                          "", q, flags=re.IGNORECASE).strip()
+            q = f"{core} location geography"
+        elif re.match(r"^when\b", q, re.IGNORECASE):
+            core = re.sub(r"^when\s+(is|are|was|were|did|do|does)?\s*",
+                          "", q, flags=re.IGNORECASE).strip()
+            q = f"{core} date year time"
+        elif re.match(r"^who\b", q, re.IGNORECASE):
+            core = re.sub(r"^who\s+(is|are|was|were|did)?\s*",
+                          "", q, flags=re.IGNORECASE).strip()
+            q = f"{core} person identity"
+        elif re.match(r"^which\b", q, re.IGNORECASE):
+            core = re.sub(r"^which\s+", "", q, flags=re.IGNORECASE).strip()
+            q = f"{core} specific type"
+        else:
+            # how many / how much / how long / how far / how old
+            core = re.sub(
+                r"^(how many|how much|how long|how far|how old)\s+"
+                r"(is|are|was|were|do|does|did)?\s*",
+                "", q, flags=re.IGNORECASE,
+            ).strip()
+            measure = re.match(r"^(how many|how much|how long|how far|how old)",
+                               q, re.IGNORECASE)
+            suffix = {
+                "how many": "number count quantity",
+                "how much": "amount cost price",
+                "how long": "duration length time",
+                "how far": "distance range",
+                "how old": "age years",
+            }.get(measure.group(1).lower() if measure else "", "amount")
+            q = f"{core} {suffix}"
+
+    elif intent == "yesno":
+        # "is X Y" → "X Y explanation"
+        core = re.sub(
+            r"^(is|are|do|does|did|can|could|will|would|was|were|"
+            r"has|have|should)\s+",
+            "", q, flags=re.IGNORECASE,
+        ).strip()
+        q = f"{core} explanation"
+
+    elif intent == "comparison":
+        # "X vs Y" → "comparison X and Y differences similarities"
+        core = re.sub(
+            r"\b(vs\.?|versus|compared? to)\b", "and",
+            q, flags=re.IGNORECASE,
+        ).strip()
+        q = f"comparison {core} differences similarities"
+
+    else:
+        # General: extract as-is, append "information"
+        q = f"{q} information"
+
+    # Vocabulary expansion (50% chance to add a synonym)
+    if random.random() < 0.5:
+        q = _expand_vocabulary(q)
+
     return q
+
+
+_LLM_SYSTEM_PROMPT = """You are a search query optimizer. Given a user query, rewrite it to better match the vocabulary of encyclopedia-style answer passages.
+
+Rules:
+- Convert questions to declarative/noun-phrase form
+- Replace colloquial terms with formal equivalents
+- Add domain-specific synonyms that documents would use
+- Do NOT add generic filler words like "guide", "tips", "overview", "advice"
+- Keep the rewrite concise (under 15 words)
+- Return ONLY the rewritten query, nothing else"""
+
+_LLM_FEW_SHOT = [
+    ("what is a conifer", "conifer definition evergreen cone-bearing tree"),
+    ("how long is a rugby match", "rugby match duration time length minutes"),
+    ("best tragedies of ancient greece", "greatest ancient Greek tragedies Sophocles Euripides"),
+    ("is mirin halal", "mirin halal status Islamic permissibility rice wine"),
+    ("where are precambrian rocks found", "precambrian rock locations geological distribution"),
+    ("what does mrna do", "mRNA function role protein synthesis translation"),
+    ("cost to treat termites", "termite treatment cost price extermination expense"),
+    ("salary for pvt in us army", "US army private salary pay compensation rank E-1"),
+]
 
 
 def llm_rewrite(
@@ -150,14 +289,16 @@ def llm_rewrite(
 ) -> str:
     """Rewrite via LLM if available, else fall back to rules.
 
+    Uses an intent-aware few-shot prompt designed to produce
+    declarative, vocabulary-expanded rewrites that align with
+    encyclopedia-style answer passages.
+
     Parameters
     ----------
     query : str
         Original user query.
     llm_callable : callable, optional
-        A function that takes a prompt string and returns the LLM's text
-        response.  Compatible with ``openai.ChatCompletion`` wrappers or
-        any local model serving the same interface.
+        A function ``(prompt: str) -> str`` returning the LLM response.
 
     Returns
     -------
@@ -167,15 +308,20 @@ def llm_rewrite(
     if llm_callable is None:
         return rule_based_rewrite(query)
 
+    examples = "\n".join(
+        f"  Query: {q}\n  Rewrite: {r}" for q, r in _LLM_FEW_SHOT
+    )
     prompt = (
-        "Rewrite the following search query so that it better captures "
-        "the user's intent while using different vocabulary.  Return ONLY "
-        "the rewritten query, nothing else.\n\n"
+        f"{_LLM_SYSTEM_PROMPT}\n\n"
+        f"Examples:\n{examples}\n\n"
         f"Query: {query}\nRewrite:"
     )
     try:
         result = llm_callable(prompt).strip()
-        return result if result else rule_based_rewrite(query)
+        # Reject if LLM returns something too long or empty
+        if result and len(result.split()) <= 25:
+            return result
+        return rule_based_rewrite(query)
     except Exception:
         return rule_based_rewrite(query)
 
@@ -448,14 +594,74 @@ def build_dataset(
 
 
 # ================================================================
-# 5. Main
+# 5. OpenAI-compatible LLM client
+# ================================================================
+
+def make_openai_callable() -> Optional[Callable[[str], str]]:
+    """Build a callable ``(prompt) -> response_text`` from env vars.
+
+    Required env vars (at least one key must be set)::
+
+        GPT5_KEY / OPENAI_API_KEY
+        CHATGPT_MODEL / AUDIT_MODEL   (default: gpt-4o)
+        CHATGPT_BASE_URL / OPENAI_BASE_URL / OPENAI_API_BASE
+
+    Returns ``None`` if no API key is found.
+    """
+    api_key = os.getenv("GPT5_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    model = os.getenv("CHATGPT_MODEL") or os.getenv("AUDIT_MODEL", "gpt-4o")
+    base_url = (
+        os.getenv("CHATGPT_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("OPENAI_API_BASE")
+    )
+
+    try:
+        from openai import OpenAI  # type: ignore[import-untyped]
+    except ImportError:
+        print("  [warn] openai package not installed — falling back to rules")
+        return None
+
+    kwargs: Dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = OpenAI(**kwargs)  # type: ignore[arg-type]
+    print(f"  LLM rewrite enabled: model={model}")
+    if base_url:
+        print(f"  base_url={base_url}")
+
+    def _call(prompt: str) -> str:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=60,
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content or ""
+
+    return _call
+
+
+# ================================================================
+# 6. Main
 # ================================================================
 
 def main() -> None:
+    llm_fn = make_openai_callable()
+    if llm_fn is None:
+        print("  [info] No LLM API key found — using rule-based rewrite only")
+
     build_dataset(
         n_samples=500,
         n_distractor_pool=5000,
         output_path="data/MS_MARCO/intent_dataset.jsonl",
+        llm_callable=llm_fn,
         neg_ratio={"hard": 0.4, "medium": 0.4, "easy": 0.2},
     )
 

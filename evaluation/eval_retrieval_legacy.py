@@ -404,10 +404,130 @@ def evaluate(
             print(f"          rew:  \"{r['query_rewrite'][:80]}\"")
             print(f"          cos(Q,P+)={r['cos_q_pos']:.3f}  cos(Rew,P+)~={r['cos_q_rewrite']:.3f}  tier={r.get('gap_type','?')}")
 
+    # ── RQ4: Retrieval Confidence Gating ──────────────────────
+    # Gate logic: if top-1 retrieval score for original query >= τ,
+    # the original is already good — skip rewrite; otherwise use rewrite.
+    print("\n\n  ══ RQ4 — Retrieval Confidence Gating (Plan A) ══")
+    print("  Gate: cos(orig_query, top1_doc) ≥ τ → keep original; < τ → use rewrite\n")
+
+    thresholds = [round(t * 0.05 + 0.50, 2) for t in range(10)]  # 0.50 .. 0.95
+
+    gate_rows: List[Tuple[str, ...]] = [
+        ("τ", "N_kept", "N_rewrite", "Recall@1", "MRR", "Helped", "Hurt", "Net", "vs_ungated"),
+    ]
+
+    best_tau = 0.0
+    best_recall = 0.0
+
+    for tau in thresholds:
+        # Build gated embedding: original if confident, rewrite otherwise
+        gated_emb = np.empty_like(orig_emb)
+        n_kept = 0
+        for i in range(len(records)):
+            if orig_scores[i, 0] >= tau:
+                gated_emb[i] = orig_emb[i]
+                n_kept += 1
+            else:
+                gated_emb[i] = rewrite_emb[i]
+
+        n_rewrite = len(records) - n_kept
+
+        # Search with gated queries
+        _, gated_indices = search(index, gated_emb, top_k)
+
+        # Metrics
+        g_recall1 = recall_at_k(gated_indices, gold_pos_ids, 1)
+        g_mrr = mrr(gated_indices, gold_pos_ids, top_k)
+
+        # Per-sample analysis vs original
+        g_helped = 0
+        g_hurt = 0
+        for i in range(len(records)):
+            o_hit = gold_pos_ids[i] in orig_indices[i, :1]
+            g_hit = gold_pos_ids[i] in gated_indices[i, :1]
+            if not o_hit and g_hit:
+                g_helped += 1
+            elif o_hit and not g_hit:
+                g_hurt += 1
+
+        net = g_helped - g_hurt
+        vs_ungated = g_recall1 - r1_rew  # vs ungated rewrite
+
+        gate_rows.append((
+            f"{tau:.2f}",
+            str(n_kept), str(n_rewrite),
+            f"{g_recall1:.4f}", f"{g_mrr:.4f}",
+            str(g_helped), str(g_hurt),
+            f"{net:+d}", f"{vs_ungated:+.4f}",
+        ))
+
+        if g_recall1 > best_recall:
+            best_recall = g_recall1
+            best_tau = tau
+
+    print_table("Threshold Sweep — Gated Rewrite", gate_rows)
+
+    print(f"\n  Best τ = {best_tau:.2f}  →  Recall@1 = {best_recall:.4f}"
+          f"  (orig={r1_orig:.4f}, ungated_rew={r1_rew:.4f})")
+    gain_over_orig = best_recall - r1_orig
+    gain_over_rew = best_recall - r1_rew
+    print(f"  Gain over original:        {gain_over_orig:+.4f}")
+    print(f"  Gain over ungated rewrite: {gain_over_rew:+.4f}")
+
+    results["gate_best_tau"] = best_tau
+    results["gate_best_recall1"] = round(best_recall, 4)
+    results["gate_gain_over_orig"] = round(gain_over_orig, 4)
+    results["gate_gain_over_ungated"] = round(gain_over_rew, 4)
+
+    # ── Detail for best τ ─────────────────────────────────────
+    gated_emb_best = np.empty_like(orig_emb)
+    gate_decisions: List[str] = []  # "keep" or "rewrite"
+    for i in range(len(records)):
+        if orig_scores[i, 0] >= best_tau:
+            gated_emb_best[i] = orig_emb[i]
+            gate_decisions.append("keep")
+        else:
+            gated_emb_best[i] = rewrite_emb[i]
+            gate_decisions.append("rewrite")
+
+    _, gated_best_indices = search(index, gated_emb_best, top_k)
+
+    # Show examples where gating fixed a "hurt" case
+    gating_saved: List[int] = []   # was hurt by rewrite, gating kept original → still hit
+    gating_missed: List[int] = []  # was helped by rewrite, but gating refused → still miss
+
+    for i in range(len(records)):
+        o_hit = gold_pos_ids[i] in orig_indices[i, :1]
+        r_hit = gold_pos_ids[i] in rew_indices[i, :1]
+        g_hit = gold_pos_ids[i] in gated_best_indices[i, :1]
+        if o_hit and not r_hit and g_hit:
+            gating_saved.append(i)
+        if not o_hit and r_hit and not g_hit:
+            gating_missed.append(i)
+
+    print(f"\n  At τ={best_tau:.2f}:")
+    print(f"    Gating SAVED (hurt→hit):  {len(gating_saved)}")
+    print(f"    Gating LOST  (helped→miss): {len(gating_missed)}")
+
+    if gating_saved:
+        print(f"\n  ▸ Gating SAVED — would have been hurt, gate kept original (up to 5):")
+        for idx in gating_saved[:5]:
+            r = records[idx]
+            print(f"    [{idx:3d}] \"{r['query_original'][:70]}\"")
+            print(f"          top1_score={orig_scores[idx,0]:.3f}  cos(Q,P+)={r['cos_q_pos']:.3f}")
+
+    if gating_missed:
+        print(f"\n  ▸ Gating LOST — would have been helped, gate blocked rewrite (up to 5):")
+        for idx in gating_missed[:5]:
+            r = records[idx]
+            print(f"    [{idx:3d}] \"{r['query_original'][:70]}\"")
+            print(f"          top1_score={orig_scores[idx,0]:.3f}  cos(Q,P+)={r['cos_q_pos']:.3f}")
+
     print()
 
     # Save metrics to JSON
-    metrics_path = str(Path(dataset_path).parent / "eval_metrics.json")
+    metrics_path = str(Path("evaluation/result") / "eval_metrics.json")
+    Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"  Metrics saved → {metrics_path}\n")

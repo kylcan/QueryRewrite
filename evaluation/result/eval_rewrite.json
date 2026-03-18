@@ -1,0 +1,20 @@
+{
+  "model": "all-MiniLM-L6-v2",
+  "n_queries": 500,
+  "recall@1_orig": 0.774,
+  "recall@1_rewrite": 0.788,
+  "recall@3_orig": 0.992,
+  "recall@3_rewrite": 0.988,
+  "recall@5_orig": 0.994,
+  "recall@5_rewrite": 0.994,
+  "recall@10_orig": 0.994,
+  "recall@10_rewrite": 0.996,
+  "recall@20_orig": 0.998,
+  "recall@20_rewrite": 0.996,
+  "mrr_orig": 0.8821,
+  "mrr_rewrite": 0.8887,
+  "rewrite_helped": 38,
+  "rewrite_hurt": 31,
+  "rewrite_both_hit": 356,
+  "rewrite_both_miss": 75
+}

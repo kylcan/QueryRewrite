@@ -1,0 +1,8 @@
+{
+  "recall@1_orig": 0.774,
+  "recall@1_ungated_rewrite": 0.788,
+  "gate_best_tau": 0.7,
+  "gate_best_recall1": 0.804,
+  "gate_gain_over_orig": 0.03,
+  "gate_gain_over_ungated": 0.016
+}
