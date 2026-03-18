@@ -13,11 +13,13 @@ The pipeline:
 5. Reports per-query hits, cosine similarities, and Recall@K.
 """
 
+# pyright: reportCallIssue=false
+
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import faiss
 import numpy as np
@@ -72,7 +74,7 @@ def encode_texts(
 # ── FAISS index ──────────────────────────────────────────────────
 
 
-def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
+def build_faiss_index(embeddings: np.ndarray) -> Any:
     """Build a flat inner-product FAISS index.
 
     With L2-normalised vectors, inner product equals cosine similarity.
@@ -84,17 +86,17 @@ def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
 
     Returns
     -------
-    faiss.IndexFlatIP
-        Populated index ready for search.
+    Any
+        Populated FAISS index ready for search.
     """
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings)
+    index: Any = faiss.IndexFlatIP(dim)
+    getattr(index, "add")(embeddings)
     return index
 
 
 def search_index(
-    index: faiss.IndexFlatIP,
+    index: Any,
     query_embeddings: np.ndarray,
     top_k: int = 10,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -105,7 +107,7 @@ def search_index(
     tuple[np.ndarray, np.ndarray]
         ``(scores, indices)`` each of shape ``(Q, top_k)``.
     """
-    scores, indices = index.search(query_embeddings, top_k)
+    scores, indices = getattr(index, "search")(query_embeddings, top_k)
     return scores, indices
 
 
