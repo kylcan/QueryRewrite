@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer
 
 
 class EmbeddingModel(nn.Module):
@@ -32,7 +34,11 @@ class EmbeddingModel(nn.Module):
         pooling: str = "mean",
     ) -> None:
         super().__init__()
-        raise NotImplementedError
+        self.model_name = model_name
+        self.embedding_dim = embedding_dim
+        self.pooling = pooling
+        self.encoder = AutoModel.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def forward(
         self,
@@ -53,50 +59,37 @@ class EmbeddingModel(nn.Module):
         torch.Tensor
             Normalised embeddings of shape ``(batch, embedding_dim)``.
         """
-        raise NotImplementedError
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = outputs.last_hidden_state
+
+        if self.pooling == "cls":
+            pooled = self._cls_pool(hidden)
+        else:
+            pooled = self._mean_pool(hidden, attention_mask)
+
+        return F.normalize(pooled, p=2, dim=-1)
 
     def _mean_pool(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply mean-pooling over non-padding tokens.
-
-        Parameters
-        ----------
-        hidden_states : torch.Tensor
-            Encoder outputs ``(batch, seq_len, hidden_dim)``.
-        attention_mask : torch.Tensor
-            Mask ``(batch, seq_len)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Pooled embeddings ``(batch, hidden_dim)``.
-        """
-        raise NotImplementedError
+        """Apply mean-pooling over non-padding tokens."""
+        mask = attention_mask.unsqueeze(-1).float()
+        summed = (hidden_states * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-9)
+        return summed / counts
 
     def _cls_pool(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return the [CLS] token representation.
+        """Return the [CLS] token representation."""
+        return hidden_states[:, 0, :]
 
-        Parameters
-        ----------
-        hidden_states : torch.Tensor
-            Encoder outputs ``(batch, seq_len, hidden_dim)``.
-
-        Returns
-        -------
-        torch.Tensor
-            CLS embeddings ``(batch, hidden_dim)``.
-        """
-        raise NotImplementedError
-
+    @torch.no_grad()
     def encode(
         self,
-        texts: list[str],
-        tokenizer: object,
+        texts: List[str],
         batch_size: int = 64,
-        device: Optional[str] = None,
+        device: Optional[torch.device | str] = None,
     ) -> torch.Tensor:
         """High-level helper: tokenise raw strings and return embeddings.
 
@@ -104,8 +97,6 @@ class EmbeddingModel(nn.Module):
         ----------
         texts : list[str]
             Raw text strings.
-        tokenizer : object
-            HuggingFace tokenizer.
         batch_size : int
             Inference batch size.
         device : str, optional
@@ -116,4 +107,23 @@ class EmbeddingModel(nn.Module):
         torch.Tensor
             Stacked embeddings ``(N, embedding_dim)``.
         """
-        raise NotImplementedError
+        if device is None:
+            dev = next(self.parameters()).device
+        else:
+            dev = torch.device(device)
+
+        self.eval()
+        all_embs = []
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            encoded = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors="pt",
+            )
+            encoded = {k: v.to(dev) for k, v in encoded.items()}
+            emb = self.forward(encoded["input_ids"], encoded["attention_mask"])
+            all_embs.append(emb.cpu())
+        return torch.cat(all_embs, dim=0)

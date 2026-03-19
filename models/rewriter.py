@@ -1,11 +1,38 @@
-"""LLM-based query rewriter with optional LoRA fine-tuning."""
+"""LLM-based query rewriter with LoRA fine-tuning via PEFT.
+
+Supports two training paradigms:
+  - **SFT** (Supervised Fine-Tuning): train on (prompt, completion) pairs
+  - **DPO** (Direct Preference Optimization): train on (prompt, chosen, rejected)
+
+The base model is loaded in a memory-efficient configuration suitable for
+consumer hardware (e.g. Apple Silicon with 16 GB unified memory).
+
+Architecture::
+
+    ┌────────────────────────────┐
+    │  Base Causal LM            │  (frozen weights)
+    │  e.g. Qwen/Qwen2.5-0.5B   │
+    ├────────────────────────────┤
+    │  LoRA Adapters             │  (trainable, rank=16)
+    │  target: q_proj, v_proj,   │
+    │          k_proj, o_proj     │
+    └────────────────────────────┘
+"""
 
 from __future__ import annotations
 
+import copy
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+)
 
 
 class QueryRewriter(nn.Module):
@@ -14,27 +41,76 @@ class QueryRewriter(nn.Module):
     Parameters
     ----------
     base_model_name : str
-        HuggingFace model identifier (e.g. ``meta-llama/Llama-2-7b-hf``).
+        HuggingFace model identifier (e.g. ``Qwen/Qwen2.5-0.5B``).
     lora_rank : int
         Rank for LoRA decomposition.
     lora_alpha : int
-        LoRA scaling factor.
+        LoRA scaling factor (typically ``2 * rank``).
     lora_dropout : float
         Dropout probability inside LoRA layers.
-    target_modules : list[str]
-        Names of attention projection layers to adapt.
+    target_modules : list[str] | None
+        Attention projection layers to adapt. If None, uses a sensible
+        default covering all attention projections.
+    load_in_8bit : bool
+        Use 8-bit quantization for the base model (requires bitsandbytes).
     """
 
     def __init__(
         self,
-        base_model_name: str,
+        base_model_name: str = "Qwen/Qwen2.5-0.5B",
         lora_rank: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
         target_modules: Optional[List[str]] = None,
+        load_in_8bit: bool = False,
     ) -> None:
         super().__init__()
-        raise NotImplementedError
+        self.base_model_name = base_model_name
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+
+        if target_modules is None:
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+        # Load tokenizer
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+            base_model_name,
+            trust_remote_code=True,
+            padding_side="left",
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # Load base model
+        model_kwargs: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "torch_dtype": torch.float32,
+        }
+        if load_in_8bit:
+            model_kwargs["load_in_8bit"] = True
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name, **model_kwargs
+        )
+
+        # Apply LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        self.model = get_peft_model(base_model, lora_config)
+        self._print_trainable_params()
+
+    def _print_trainable_params(self) -> None:
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        pct = 100.0 * trainable / total if total > 0 else 0.0
+        print(f"  Trainable params: {trainable:,} / {total:,} ({pct:.2f}%)")
 
     def forward(
         self,
@@ -46,20 +122,25 @@ class QueryRewriter(nn.Module):
 
         Parameters
         ----------
-        input_ids : torch.Tensor
-            Token IDs of shape ``(batch, seq_len)``.
-        attention_mask : torch.Tensor
-            Attention mask of shape ``(batch, seq_len)``.
-        labels : torch.Tensor, optional
-            Target token IDs for language-modelling loss.
+        input_ids : (batch, seq_len)
+        attention_mask : (batch, seq_len)
+        labels : (batch, seq_len), optional — Target token IDs for LM loss.
 
         Returns
         -------
-        dict[str, torch.Tensor]
-            ``logits`` and optionally ``loss``.
+        dict with ``logits`` and optionally ``loss``.
         """
-        raise NotImplementedError
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        result: Dict[str, torch.Tensor] = {"logits": outputs.logits}
+        if outputs.loss is not None:
+            result["loss"] = outputs.loss
+        return result
 
+    @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -67,40 +148,97 @@ class QueryRewriter(nn.Module):
         max_new_tokens: int = 64,
         **generate_kwargs: Any,
     ) -> torch.Tensor:
-        """Auto-regressively generate rewritten queries.
+        """Auto-regressively generate rewritten queries."""
+        self.model.eval()
+        return self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+            **generate_kwargs,
+        )
+
+    @torch.no_grad()
+    def rewrite_queries(
+        self,
+        queries: List[str],
+        max_new_tokens: int = 64,
+        batch_size: int = 8,
+        device: Optional[str] = None,
+    ) -> List[str]:
+        """High-level API: rewrite a list of raw query strings.
 
         Parameters
         ----------
-        input_ids : torch.Tensor
-            Prompt token IDs.
-        attention_mask : torch.Tensor
-            Attention mask.
-        max_new_tokens : int
-            Maximum number of new tokens to generate.
+        queries : list[str] — Raw user queries.
+        max_new_tokens : int — Max generation length.
+        batch_size : int — Inference batch size.
+        device : str, optional — Device override.
 
         Returns
         -------
-        torch.Tensor
-            Generated token IDs.
+        list[str] — Rewritten queries.
         """
-        raise NotImplementedError
+        from data.MS_MARCO.build_preference_data import format_sft_prompt
+
+        if device is None:
+            device = next(self.model.parameters()).device.type
+
+        self.model.eval()
+        results: List[str] = []
+
+        for i in range(0, len(queries), batch_size):
+            batch = queries[i : i + batch_size]
+            prompts = [format_sft_prompt(q) for q in batch]
+
+            encoded = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt",
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            prompt_len = encoded["input_ids"].shape[1]
+
+            output_ids = self.generate(
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                max_new_tokens=max_new_tokens,
+            )
+
+            for j in range(output_ids.shape[0]):
+                gen_ids = output_ids[j, prompt_len:]
+                text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+                results.append(text)
+
+        return results
 
     def save_adapter(self, path: str) -> None:
-        """Persist only the LoRA adapter weights.
-
-        Parameters
-        ----------
-        path : str
-            Directory to save adapter weights.
-        """
-        raise NotImplementedError
+        """Persist only the LoRA adapter weights."""
+        Path(path).mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(path)
+        self.tokenizer.save_pretrained(path)
+        print(f"  LoRA adapter saved to {path}")
 
     def load_adapter(self, path: str) -> None:
-        """Load LoRA adapter weights from disk.
+        """Load LoRA adapter weights from disk."""
+        self.model = PeftModel.from_pretrained(
+            self.model.base_model.model,
+            path,
+            is_trainable=True,
+        )
+        print(f"  LoRA adapter loaded from {path}")
 
-        Parameters
-        ----------
-        path : str
-            Directory containing saved adapter weights.
+    def get_ref_model(self) -> nn.Module:
+        """Create a frozen copy of the current model for DPO reference.
+
+        Returns a model with the same architecture but detached from
+        gradient computation. Used as π_ref in DPO.
         """
-        raise NotImplementedError
+        ref = copy.deepcopy(self.model)
+        for param in ref.parameters():
+            param.requires_grad = False
+        ref.eval()
+        return ref

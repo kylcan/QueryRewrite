@@ -6,7 +6,6 @@ from evaluation.metrics import (
     mrr_arr,
     hard_neg_in_topk,
 )
-from evaluation.shared import RetrievalContext
 
 __all__ = [
     "recall_at_k",
@@ -20,7 +19,10 @@ __all__ = [
 
 
 def __getattr__(name: str):  # type: ignore[override]
-    """Lazy import for RetrievalEvaluator to avoid heavy torch import chain."""
+    """Lazy import for heavy modules to avoid faiss/torch import conflicts."""
+    if name == "RetrievalContext":
+        from evaluation.shared import RetrievalContext
+        return RetrievalContext
     if name == "RetrievalEvaluator":
         from evaluation.evaluator import RetrievalEvaluator
         return RetrievalEvaluator

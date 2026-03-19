@@ -1,11 +1,12 @@
-"""Learning-rate scheduler factory."""
+"""Learning-rate scheduler factory with warmup support."""
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import _LRScheduler
+from torch.optim.lr_scheduler import LambdaLR
 
 
 def build_scheduler(
@@ -13,7 +14,7 @@ def build_scheduler(
     num_training_steps: int,
     warmup_ratio: float = 0.1,
     scheduler_type: str = "linear",
-) -> _LRScheduler:
+) -> LambdaLR:
     """Build a learning-rate scheduler with warmup.
 
     Parameters
@@ -29,7 +30,31 @@ def build_scheduler(
 
     Returns
     -------
-    _LRScheduler
+    LambdaLR
         Configured scheduler instance.
     """
-    raise NotImplementedError
+    num_warmup_steps = int(num_training_steps * warmup_ratio)
+
+    if scheduler_type == "linear":
+        def lr_lambda(current_step: int) -> float:
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            return max(
+                0.0,
+                float(num_training_steps - current_step)
+                / float(max(1, num_training_steps - num_warmup_steps)),
+            )
+
+    elif scheduler_type == "cosine":
+        def lr_lambda(current_step: int) -> float:
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            progress = float(current_step - num_warmup_steps) / float(
+                max(1, num_training_steps - num_warmup_steps)
+            )
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    else:
+        raise ValueError(f"Unknown scheduler type: {scheduler_type!r}")
+
+    return LambdaLR(optimizer, lr_lambda)
