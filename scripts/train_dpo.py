@@ -56,6 +56,11 @@ def main() -> None:
     parser.add_argument("--checkpoint_dir", default="checkpoints/dpo")
     parser.add_argument("--scheduler", default="cosine", choices=["linear", "cosine"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--deepspeed", default=None, metavar="DS_CONFIG",
+        help="Path to DeepSpeed JSON config (e.g. configs/deepspeed_zero3.json). "
+             "Launch with: deepspeed --num_gpus N scripts/train_dpo.py --deepspeed ...",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -106,6 +111,9 @@ def main() -> None:
     print(f"    LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}")
     print(f"    Scheduler: {args.scheduler}")
 
+    if args.deepspeed:
+        print(f"  DeepSpeed config: {args.deepspeed}")
+
     trainer = DPOTrainer(
         model=model,
         ref_model=ref_model,
@@ -119,6 +127,7 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation,
         device=device,
         checkpoint_dir=args.checkpoint_dir,
+        deepspeed_config=args.deepspeed,
     )
 
     history = trainer.train()

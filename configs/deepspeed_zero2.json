@@ -1,0 +1,63 @@
+{
+  "_comment": "DeepSpeed ZeRO Stage 2 — for 7B SFT training on 4×A100 40G",
+  "_usage": "deepspeed --num_gpus 4 scripts/train_sft.py --deepspeed configs/deepspeed_zero2.json",
+
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": 1.0,
+
+  "zero_optimization": {
+    "stage": 2,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 2e8,
+    "overlap_comm": true,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 2e8,
+    "contiguous_gradients": true
+  },
+
+  "bf16": {
+    "enabled": true
+  },
+  "fp16": {
+    "enabled": false
+  },
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": "auto",
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "weight_decay": "auto"
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupCosineAnnealing",
+    "params": {
+      "warmup_min_ratio": 0.0,
+      "warmup_num_steps": "auto",
+      "total_num_steps": "auto"
+    }
+  },
+
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": true,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false,
+    "profile": false
+  },
+
+  "wall_clock_breakdown": false,
+
+  "_note": [
+    "ZeRO-2 shards optimizer states + gradients across GPUs",
+    "Model weights are replicated (unlike ZeRO-3)",
+    "Best for SFT where you need fast forward passes",
+    "Memory per GPU: ~22GB for 7B + LoRA rank=64 at bf16",
+    "Throughput: ~1800 tokens/s on 4×A100 40G"
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "_comment": "DeepSpeed ZeRO Stage 3 + CPU offload — for 7B on single A100 40G or 2×RTX 4090",
+  "_usage": "deepspeed --num_gpus 1 scripts/train_dpo.py --deepspeed configs/deepspeed_zero3_offload.json",
+
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": 1.0,
+
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "offload_param": {
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "sub_group_size": 1e9,
+    "reduce_bucket_size": "auto",
+    "stage3_prefetch_bucket_size": "auto",
+    "stage3_param_persistence_threshold": "auto",
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+
+  "bf16": {
+    "enabled": true
+  },
+  "fp16": {
+    "enabled": false
+  },
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": "auto",
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "weight_decay": "auto"
+    }
+  },
+
+  "_note": [
+    "ZeRO-3 + CPU offload: enables 7B training on single A100 40G",
+    "Optimizer states and params offloaded to CPU RAM (requires 64GB+ RAM)",
+    "Throughput: ~200-400 tokens/s (CPU↔GPU transfer overhead)",
+    "Use for experiments / debugging; prefer configs/deepspeed_zero3.json for production"
+  ]
+}

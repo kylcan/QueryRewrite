@@ -126,13 +126,19 @@ class DPOTrainer:
     max_grad_norm : float
         Gradient clipping norm.
     gradient_accumulation_steps : int
-        Accumulate gradients over this many steps.
+        Accumulate gradients over this many steps (ignored when using DeepSpeed).
     device : str
         Target device.
     checkpoint_dir : str
         Where to save checkpoints.
     label_smoothing : float
         DPO label smoothing (0 = standard DPO).
+    deepspeed_config : str | None
+        Path to a DeepSpeed JSON config.  Only the policy model is wrapped;
+        the reference model stays as a plain frozen module.
+    max_steps : int | None
+        Stop training after this many gradient steps (across all epochs).
+        Useful for iterative DPO where each round trains for a fixed budget.
     """
 
     def __init__(
@@ -152,6 +158,8 @@ class DPOTrainer:
         device: str = "cpu",
         checkpoint_dir: str = "checkpoints/dpo",
         label_smoothing: float = 0.0,
+        deepspeed_config: Optional[str] = None,
+        max_steps: Optional[int] = None,
     ) -> None:
         self.device = device
         self.epochs = epochs
@@ -159,14 +167,20 @@ class DPOTrainer:
         self.max_grad_norm = max_grad_norm
         self.grad_accum = gradient_accumulation_steps
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.max_steps = max_steps
+        self.use_deepspeed = False
+        self.engine = None
 
         # Models
         self.model = model
         self.ref_model = ref_model
-        if hasattr(model, "model"):
-            model.model.to(device)
-        else:
-            model.to(device)
+
+        # Device placement (DeepSpeed handles it for the policy)
+        if deepspeed_config is None:
+            if hasattr(model, "model"):
+                model.model.to(device)
+            else:
+                model.to(device)
         ref_model.to(device)
 
         # Loss
@@ -188,38 +202,59 @@ class DPOTrainer:
                 collate_fn=dpo_collate_fn,
             )
 
-        # Optimizer (only trainable params)
-        self.optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=lr,
-            weight_decay=weight_decay,
-        )
+        if deepspeed_config is not None:
+            # ── DeepSpeed path ───────────────────────────────────────────────
+            # Only the trainable policy is wrapped; the frozen ref model is
+            # kept as a plain module on the same device.
+            import json
+            import deepspeed as _ds  # type: ignore[import]
 
-        # Scheduler
-        from training.scheduler import build_scheduler
-        num_steps = len(self.train_loader) * epochs // self.grad_accum
-        self.scheduler = build_scheduler(
-            self.optimizer, num_steps,
-            warmup_ratio=warmup_ratio,
-            scheduler_type="cosine",
-        )
+            with open(deepspeed_config) as _f:
+                ds_cfg = json.load(_f)
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            self.engine, self.optimizer, _, self.scheduler = _ds.initialize(
+                model=model,
+                model_parameters=trainable_params,
+                config=ds_cfg,
+            )
+            self.use_deepspeed = True
+            self.device = self.engine.device
+            # Also move ref model to the same device
+            ref_model.to(self.device)
+        else:
+            # ── Standard PyTorch path ─────────────────────────────────────────
+            self.optimizer = torch.optim.AdamW(
+                [p for p in model.parameters() if p.requires_grad],
+                lr=lr,
+                weight_decay=weight_decay,
+            )
+            from training.scheduler import build_scheduler
+            num_steps = len(self.train_loader) * epochs // self.grad_accum
+            self.scheduler = build_scheduler(
+                self.optimizer, num_steps,
+                warmup_ratio=warmup_ratio,
+                scheduler_type="cosine",
+            )
+
         self.best_val_loss = float("inf")
+        self._global_step: int = 0
 
     def _get_logps(
         self,
         model: torch.nn.Module,
         batch: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Compute per-sequence log-probs for a batch."""
+        """Compute per-sequence log-probs for a batch.
+
+        ``model`` may be the raw policy model, the DeepSpeed engine that wraps
+        it, or the frozen reference model — all support the same forward call.
+        """
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
         response_mask = batch["response_mask"].to(self.device)
 
-        if hasattr(model, "forward"):
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        else:
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         return DPOLoss.compute_logps(logits, input_ids, response_mask)
 
@@ -257,37 +292,82 @@ class DPOTrainer:
         total_loss = 0.0
         total_acc = 0.0
         n_steps = 0
-        self.optimizer.zero_grad()
+        global_step = getattr(self, "_global_step", 0)
 
-        for step, batch in enumerate(self.train_loader):
-            # Policy log-probs
-            policy_chosen_logps = self._get_logps(self.model, batch["chosen"])
-            policy_rejected_logps = self._get_logps(self.model, batch["rejected"])
+        # Determine which model handle to use for policy forwards
+        policy: Any = self.engine if self.use_deepspeed else self.model
 
-            # Reference log-probs (no grad)
-            with torch.no_grad():
-                ref_chosen_logps = self._get_logps(self.ref_model, batch["chosen"])
-                ref_rejected_logps = self._get_logps(self.ref_model, batch["rejected"])
+        if self.use_deepspeed:
+            # ── DeepSpeed training loop ───────────────────────────────────────
+            for batch in self.train_loader:
+                if self.max_steps is not None and global_step >= self.max_steps:
+                    break
 
-            loss = self.dpo_loss(
-                policy_chosen_logps,
-                policy_rejected_logps,
-                ref_chosen_logps,
-                ref_rejected_logps,
-            ) / self.grad_accum
-            loss.backward()
+                policy_chosen_logps = self._get_logps(policy, batch["chosen"])
+                policy_rejected_logps = self._get_logps(policy, batch["rejected"])
 
-            # Accuracy: does policy prefer chosen over rejected?
-            with torch.no_grad():
-                chosen_rewards = policy_chosen_logps - ref_chosen_logps
-                rejected_rewards = policy_rejected_logps - ref_rejected_logps
-                acc = (chosen_rewards > rejected_rewards).float().mean().item()
+                with torch.no_grad():
+                    ref_chosen_logps = self._get_logps(self.ref_model, batch["chosen"])
+                    ref_rejected_logps = self._get_logps(self.ref_model, batch["rejected"])
 
-            total_loss += loss.item() * self.grad_accum
-            total_acc += acc
-            n_steps += 1
+                loss = self.dpo_loss(
+                    policy_chosen_logps, policy_rejected_logps,
+                    ref_chosen_logps, ref_rejected_logps,
+                )
+                self.engine.backward(loss)
+                self.engine.step()
 
-            if (step + 1) % self.grad_accum == 0:
+                with torch.no_grad():
+                    chosen_rewards = policy_chosen_logps - ref_chosen_logps
+                    rejected_rewards = policy_rejected_logps - ref_rejected_logps
+                    acc = (chosen_rewards > rejected_rewards).float().mean().item()
+
+                total_loss += loss.item()
+                total_acc += acc
+                n_steps += 1
+                global_step += 1
+        else:
+            # ── Standard PyTorch training loop ───────────────────────────────
+            self.optimizer.zero_grad()
+            for step, batch in enumerate(self.train_loader):
+                if self.max_steps is not None and global_step >= self.max_steps:
+                    break
+
+                policy_chosen_logps = self._get_logps(policy, batch["chosen"])
+                policy_rejected_logps = self._get_logps(policy, batch["rejected"])
+
+                with torch.no_grad():
+                    ref_chosen_logps = self._get_logps(self.ref_model, batch["chosen"])
+                    ref_rejected_logps = self._get_logps(self.ref_model, batch["rejected"])
+
+                loss = self.dpo_loss(
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    ref_chosen_logps,
+                    ref_rejected_logps,
+                ) / self.grad_accum
+                loss.backward()
+
+                with torch.no_grad():
+                    chosen_rewards = policy_chosen_logps - ref_chosen_logps
+                    rejected_rewards = policy_rejected_logps - ref_rejected_logps
+                    acc = (chosen_rewards > rejected_rewards).float().mean().item()
+
+                total_loss += loss.item() * self.grad_accum
+                total_acc += acc
+                n_steps += 1
+                global_step += 1
+
+                if (step + 1) % self.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.model.parameters() if p.requires_grad],
+                        self.max_grad_norm,
+                    )
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+
+            if n_steps % self.grad_accum != 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.model.parameters() if p.requires_grad],
                     self.max_grad_norm,
@@ -296,16 +376,7 @@ class DPOTrainer:
                 self.scheduler.step()
                 self.optimizer.zero_grad()
 
-        # Handle remaining gradients
-        if n_steps % self.grad_accum != 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                self.max_grad_norm,
-            )
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad()
-
+        self._global_step = global_step
         return total_loss / max(n_steps, 1), total_acc / max(n_steps, 1)
 
     @torch.no_grad()
@@ -315,9 +386,13 @@ class DPOTrainer:
         total_acc = 0.0
         n = 0
 
+        # Always use the underlying model (not the engine) for validation;
+        # safe for ZeRO-2 where weights are replicated.
+        policy = self.model
+
         for batch in self.val_loader:  # type: ignore
-            policy_chosen_logps = self._get_logps(self.model, batch["chosen"])
-            policy_rejected_logps = self._get_logps(self.model, batch["rejected"])
+            policy_chosen_logps = self._get_logps(policy, batch["chosen"])
+            policy_rejected_logps = self._get_logps(policy, batch["rejected"])
             ref_chosen_logps = self._get_logps(self.ref_model, batch["chosen"])
             ref_rejected_logps = self._get_logps(self.ref_model, batch["rejected"])
 
@@ -340,6 +415,15 @@ class DPOTrainer:
 
     def _save(self, epoch: int, tag: str) -> None:
         path = self.checkpoint_dir / tag
+        if self.use_deepspeed:
+            # For ZeRO-2: weights replicated, adapter save works directly.
+            # For ZeRO-3: use engine.save_checkpoint() and consolidate offline.
+            save_fn = getattr(self.model, "save_adapter", None)
+            if save_fn is not None:
+                save_fn(str(path))
+            else:
+                self.engine.save_checkpoint(str(self.checkpoint_dir), tag=tag)
+            return
         save_fn = getattr(self.model, "save_adapter", None)
         if save_fn is not None:
             save_fn(str(path))

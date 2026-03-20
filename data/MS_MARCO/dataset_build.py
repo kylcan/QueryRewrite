@@ -37,6 +37,7 @@ import json
 import os
 import random
 import re
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -326,6 +327,118 @@ def llm_rewrite(
         return rule_based_rewrite(query)
 
 
+def _load_cached_rewrites(cache_path: Path) -> Dict[int, str]:
+    """Load existing rewrite cache keyed by query_id."""
+    if not cache_path.exists():
+        return {}
+
+    cached: Dict[int, str] = {}
+    with open(cache_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            query_id = record.get("query_id")
+            rewrite = record.get("query_rewrite")
+            if isinstance(query_id, int) and isinstance(rewrite, str) and rewrite:
+                cached[query_id] = rewrite
+    return cached
+
+
+def _save_corpus(corpus: List[str], corpus_output: str) -> None:
+    Path(corpus_output).parent.mkdir(parents=True, exist_ok=True)
+    with open(corpus_output, "w", encoding="utf-8") as f:
+        for idx, text in enumerate(corpus):
+            f.write(json.dumps({"id": str(idx), "text": text}, ensure_ascii=False) + "\n")
+
+
+def _generate_rewrites(
+    queries: List[str],
+    llm_callable: Optional[Callable[[str], str]],
+    cache_path: Path,
+    resume: bool = False,
+    rewrite_workers: int = 1,
+) -> List[str]:
+    """Generate rewrites with incremental cache and optional concurrency."""
+    cached = _load_cached_rewrites(cache_path) if resume else {}
+    rewrites: List[str] = [""] * len(queries)
+
+    for idx, rewrite in cached.items():
+        if 0 <= idx < len(queries):
+            rewrites[idx] = rewrite
+
+    completed = sum(1 for rewrite in rewrites if rewrite)
+    if completed:
+        print(f"  Resume enabled: loaded {completed} cached rewrites from {cache_path}")
+
+    pending_indices = [idx for idx, rewrite in enumerate(rewrites) if not rewrite]
+    if not pending_indices:
+        print("  All rewrites already cached; skipping generation.")
+        return rewrites
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    write_mode = "a" if resume and cache_path.exists() else "w"
+
+    if llm_callable is None or rewrite_workers <= 1:
+        with open(cache_path, write_mode, encoding="utf-8") as cache_file:
+            progress = tqdm(pending_indices, desc="Rewriting", initial=completed, total=len(queries))
+            for idx in progress:
+                rewrite = llm_rewrite(queries[idx], llm_callable)
+                rewrites[idx] = rewrite
+                cache_file.write(
+                    json.dumps(
+                        {"query_id": idx, "query": queries[idx], "query_rewrite": rewrite},
+                        ensure_ascii=False,
+                    ) + "\n"
+                )
+                cache_file.flush()
+        return rewrites
+
+    def _rewrite_job(item_idx: int) -> Tuple[int, str]:
+        return item_idx, llm_rewrite(queries[item_idx], llm_callable)
+
+    max_workers = min(max(rewrite_workers, 1), len(pending_indices))
+    print(f"  Rewriting with {max_workers} worker threads …")
+
+    with open(cache_path, write_mode, encoding="utf-8") as cache_file:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx: Dict[Future[Tuple[int, str]], int] = {}
+
+            initial_batch = pending_indices[:max_workers]
+            remaining = pending_indices[max_workers:]
+            for idx in initial_batch:
+                future = executor.submit(_rewrite_job, idx)
+                future_to_idx[future] = idx
+
+            with tqdm(total=len(queries), initial=completed, desc="Rewriting") as progress:
+                while future_to_idx:
+                    done, _ = wait(list(future_to_idx.keys()), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        idx = future_to_idx.pop(future)
+                        _, rewrite = future.result()
+                        rewrites[idx] = rewrite
+                        cache_file.write(
+                            json.dumps(
+                                {"query_id": idx, "query": queries[idx], "query_rewrite": rewrite},
+                                ensure_ascii=False,
+                            ) + "\n"
+                        )
+                        cache_file.flush()
+                        progress.update(1)
+
+                        if remaining:
+                            next_idx = remaining.pop(0)
+                            next_future = executor.submit(_rewrite_job, next_idx)
+                            future_to_idx[next_future] = next_idx
+
+    return rewrites
+
+
 # ================================================================
 # 3. Hard Negative Mining (score-band filtering)
 # ================================================================
@@ -482,8 +595,11 @@ def build_dataset(
     n_samples: int = 500,
     n_distractor_pool: int = 5000,
     output_path: str = "data/MS_MARCO/intent_dataset.jsonl",
+    corpus_output_path: Optional[str] = None,
     llm_callable: Optional[Callable[[str], str]] = None,
     neg_ratio: Optional[Dict[str, float]] = None,
+    resume: bool = False,
+    rewrite_workers: int = 1,
 ) -> None:
     """End-to-end dataset construction pipeline.
 
@@ -495,6 +611,9 @@ def build_dataset(
         Rows scanned for distractor passages (controls corpus size).
     output_path : str
         Where to write the JSONL output.
+    corpus_output_path : str, optional
+        Where to write the de-duplicated corpus JSONL with ``{id, text}`` rows.
+        If omitted, defaults to ``<output_dir>/corpus.jsonl``.
     llm_callable : callable, optional
         LLM function for query rewriting.
     neg_ratio : dict, optional
@@ -506,6 +625,12 @@ def build_dataset(
 
     print("[1/5] Loading MS MARCO …")
     data, corpus = load_msmarco_subset(n_samples, n_distractor_pool)
+    corpus_output = corpus_output_path or str(Path(output_path).with_name("corpus.jsonl"))
+    rewrite_cache_path = Path(output_path).with_name(Path(output_path).stem + "_rewrites.jsonl")
+    doc_to_idx = {doc: idx for idx, doc in enumerate(corpus)}
+
+    _save_corpus(corpus, corpus_output)
+    print(f"      Saved {len(corpus)} corpus passages → {corpus_output}")
 
     print("[2/5] Building negative miner …")
     miner = HardNegativeMiner(corpus)
@@ -523,7 +648,13 @@ def build_dataset(
     print("[3/5] Generating query rewrites …")
     queries = [d["query"] for d in data]
     pos_docs = [d["pos_doc"] for d in data]
-    rewrites = [llm_rewrite(q, llm_callable) for q in tqdm(queries, desc="Rewriting")]
+    rewrites = _generate_rewrites(
+        queries,
+        llm_callable,
+        rewrite_cache_path,
+        resume=resume,
+        rewrite_workers=rewrite_workers,
+    )
 
     # Batch mine negatives
     print("[4/5] Mining negatives (batched) …")
@@ -557,12 +688,19 @@ def build_dataset(
     for i in range(n):
         hard_neg, cos_q_neg, neg_rank, gap_type = neg_results[i]
         gap_counts[gap_type] += 1
+        pos_id = str(doc_to_idx[pos_docs[i]])
+        hard_neg_id = str(doc_to_idx.get(hard_neg, -1))
 
         results.append({
             "query_id": i,
+            "query": queries[i],
+            "original_query": queries[i],
             "query_original": queries[i],
             "query_rewrite": rewrites[i],
+            "positive_passage_id": pos_id,
+            "pos_id": pos_id,
             "pos_doc": pos_docs[i],
+            "hard_negative_passage_id": hard_neg_id,
             "hard_neg_doc": hard_neg,
             "cos_q_pos": round(float(cos_q_pos_arr[i]), 4),
             "cos_q_neg": round(cos_q_neg, 4),
@@ -578,6 +716,8 @@ def build_dataset(
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"\n[5/5] Saved {len(results)} samples → {output_path}")
+    print(f"      Rewrite cache saved → {rewrite_cache_path}")
+    print(f"      Corpus passages saved → {corpus_output}")
     print(f"  Hard: {gap_counts['hard']}  Medium: {gap_counts['medium']}  Easy: {gap_counts['easy']}")
 
     cos_neg_arr = [r["cos_q_neg"] for r in results]
@@ -597,13 +737,13 @@ def build_dataset(
 # 5. OpenAI-compatible LLM client
 # ================================================================
 
-def make_openai_callable() -> Optional[Callable[[str], str]]:
+def make_openai_callable(model_name: Optional[str] = None) -> Optional[Callable[[str], str]]:
     """Build a callable ``(prompt) -> response_text`` from env vars.
 
     Required env vars (at least one key must be set)::
 
         GPT5_KEY / OPENAI_API_KEY
-        CHATGPT_MODEL / AUDIT_MODEL   (default: gpt-4o)
+        QUERY_REWRITE_MODEL / CHATGPT_MODEL / AUDIT_MODEL   (default: gpt-4o)
         CHATGPT_BASE_URL / OPENAI_BASE_URL / OPENAI_API_BASE
 
     Returns ``None`` if no API key is found.
@@ -612,7 +752,13 @@ def make_openai_callable() -> Optional[Callable[[str], str]]:
     if not api_key:
         return None
 
-    model = os.getenv("CHATGPT_MODEL") or os.getenv("AUDIT_MODEL", "gpt-4o")
+    model = (
+        model_name
+        or os.getenv("QUERY_REWRITE_MODEL")
+        or os.getenv("CHATGPT_MODEL")
+        or os.getenv("AUDIT_MODEL")
+        or "gpt-4o"
+    )
     base_url = (
         os.getenv("CHATGPT_BASE_URL")
         or os.getenv("OPENAI_BASE_URL")
@@ -653,16 +799,51 @@ def make_openai_callable() -> Optional[Callable[[str], str]]:
 # ================================================================
 
 def main() -> None:
-    llm_fn = make_openai_callable()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build MS MARCO intent dataset")
+    parser.add_argument("--n_samples", type=int, default=500)
+    parser.add_argument("--n_distractor_pool", type=int, default=5000)
+    parser.add_argument("--output", default="data/MS_MARCO/intent_dataset.jsonl")
+    parser.add_argument(
+        "--corpus_output",
+        default=None,
+        help="Optional corpus JSONL output path. Defaults to <output_dir>/corpus.jsonl.",
+    )
+    parser.add_argument(
+        "--rewrite_model",
+        default=None,
+        help=(
+            "LLM model used only for query rewriting. "
+            "Overrides QUERY_REWRITE_MODEL / CHATGPT_MODEL / AUDIT_MODEL."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume rewrite generation from the cache file if it exists.",
+    )
+    parser.add_argument(
+        "--rewrite_workers",
+        type=int,
+        default=1,
+        help="Number of concurrent worker threads for API-based query rewriting.",
+    )
+    args = parser.parse_args()
+
+    llm_fn = make_openai_callable(model_name=args.rewrite_model)
     if llm_fn is None:
         print("  [info] No LLM API key found — using rule-based rewrite only")
 
     build_dataset(
-        n_samples=500,
-        n_distractor_pool=5000,
-        output_path="data/MS_MARCO/intent_dataset.jsonl",
+        n_samples=args.n_samples,
+        n_distractor_pool=args.n_distractor_pool,
+        output_path=args.output,
+        corpus_output_path=args.corpus_output,
         llm_callable=llm_fn,
         neg_ratio={"hard": 0.4, "medium": 0.4, "easy": 0.2},
+        resume=args.resume,
+        rewrite_workers=args.rewrite_workers,
     )
 
 

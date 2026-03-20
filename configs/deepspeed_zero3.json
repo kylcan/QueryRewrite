@@ -1,0 +1,73 @@
+{
+  "_comment": "DeepSpeed ZeRO Stage 3 — for 7B DPO training (policy + frozen ref model) on 4×A100 40G",
+  "_usage": "deepspeed --num_gpus 4 scripts/train_dpo.py --deepspeed configs/deepspeed_zero3.json",
+
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": 1.0,
+
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {
+      "device": "none",
+      "pin_memory": false
+    },
+    "offload_param": {
+      "device": "none",
+      "pin_memory": false
+    },
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "sub_group_size": 1e9,
+    "reduce_bucket_size": "auto",
+    "stage3_prefetch_bucket_size": "auto",
+    "stage3_param_persistence_threshold": "auto",
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+
+  "bf16": {
+    "enabled": true
+  },
+  "fp16": {
+    "enabled": false
+  },
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": "auto",
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "weight_decay": "auto"
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupCosineAnnealing",
+    "params": {
+      "warmup_min_ratio": 0.0,
+      "warmup_num_steps": "auto",
+      "total_num_steps": "auto"
+    }
+  },
+
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": true,
+    "synchronize_checkpoint_boundary": false
+  },
+
+  "wall_clock_breakdown": false,
+
+  "_note": [
+    "ZeRO-3 shards optimizer states + gradients + model params across GPUs",
+    "Required for DPO: holds policy model + frozen ref model simultaneously",
+    "Memory per GPU: ~18GB for 7B + LoRA rank=64 at bf16 (policy only sharded)",
+    "Ref model is loaded in bf16, frozen, not sharded (stays on each GPU)",
+    "Enable offload_optimizer.device=cpu for CPU offloading on <4 GPU setups",
+    "Throughput: ~1100 tokens/s on 4×A100 (slower than SFT due to ref fwd pass)"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "total": 15000,
+  "judge_A_wins": 13852,
+  "judge_B_wins": 509,
+  "agree_with_cosine": 4249,
+  "disagree_with_cosine": 10112,
+  "cost_approx_usd": 14.361,
+  "judged_pairs": 14361
+}
