@@ -6,4 +6,7 @@ __pycache__/
 # 忽略编译后的库文件（双重保险）
 *.dylib
 *.so
-*.dll
+*.dllcheckpoints/
+data/
+*.pt
+*.jsonl
