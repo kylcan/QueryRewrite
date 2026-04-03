@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from training.deepspeed_utils import prepare_deepspeed_config
+
 
 class SFTDataset(Dataset):
     """Dataset for SFT: (prompt, completion) pairs as causal LM sequences.
@@ -152,6 +154,7 @@ class SFTTrainer:
         checkpoint_dir: str = "checkpoints/sft",
         scheduler_type: str = "cosine",
         deepspeed_config: Optional[str] = None,
+        log_every_steps: int = 100,
     ) -> None:
         self.model = model
         self.device = device
@@ -160,6 +163,7 @@ class SFTTrainer:
         self.max_grad_norm = max_grad_norm
         self.grad_accum = gradient_accumulation_steps
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.log_every_steps = max(1, log_every_steps)
         self.use_deepspeed = False
         self.engine = None
 
@@ -195,6 +199,17 @@ class SFTTrainer:
 
             with open(deepspeed_config) as _f:
                 ds_cfg = json.load(_f)
+            total_steps = max(1, len(self.train_loader) * epochs // max(1, self.grad_accum))
+            ds_cfg = prepare_deepspeed_config(
+                ds_cfg,
+                batch_size=batch_size,
+                gradient_accumulation_steps=self.grad_accum,
+                lr=lr,
+                weight_decay=weight_decay,
+                warmup_ratio=warmup_ratio,
+                total_steps=total_steps,
+                max_grad_norm=max_grad_norm,
+            )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             # deepspeed.initialize returns (engine, optimizer, dataloader, lr_sched)
@@ -222,7 +237,20 @@ class SFTTrainer:
             )
 
         self.best_val_loss = float("inf")
-        self.engine: Any = None  # set to DeepSpeedEngine when deepspeed_config is given
+
+    def _is_main_process(self) -> bool:
+        if self.engine is not None and hasattr(self.engine, "global_rank"):
+            return self.engine.global_rank == 0
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
+        return True
+
+    def _log_step(self, prefix: str, step: int, total_steps: int, loss: float) -> None:
+        if not self._is_main_process():
+            return
+        if step % self.log_every_steps != 0:
+            return
+        print(f"    {prefix} step {step}/{total_steps}  loss={loss:.4f}")
 
     def train(self) -> Dict[str, float]:
         """Run full SFT training loop."""
@@ -252,13 +280,14 @@ class SFTTrainer:
         self.model.train()
         total_loss = 0.0
         n_steps = 0
+        total_steps = len(self.train_loader)
 
         if self.use_deepspeed:
             # ── DeepSpeed training loop ───────────────────────────────────────
             # engine.backward() + engine.step() handle gradient accumulation,
             # mixed-precision scaling, gradient clipping, optimizer.step(),
             # scheduler.step(), and zero_grad() — all per the JSON config.
-            for batch in self.train_loader:
+            for step, batch in enumerate(self.train_loader, start=1):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
@@ -273,10 +302,16 @@ class SFTTrainer:
                 self.engine.step()
                 total_loss += loss.item()
                 n_steps += 1
+                self._log_step(
+                    f"SFT epoch {epoch+1}/{self.epochs}",
+                    step,
+                    total_steps,
+                    total_loss / n_steps,
+                )
         else:
             # ── Standard PyTorch training loop ───────────────────────────────
             self.optimizer.zero_grad()
-            for step, batch in enumerate(self.train_loader):
+            for step, batch in enumerate(self.train_loader, start=1):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
@@ -291,7 +326,7 @@ class SFTTrainer:
                 total_loss += outputs["loss"].item()
                 n_steps += 1
 
-                if (step + 1) % self.grad_accum == 0:
+                if step % self.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in self.model.parameters() if p.requires_grad],
                         self.max_grad_norm,
@@ -299,6 +334,13 @@ class SFTTrainer:
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+
+                self._log_step(
+                    f"SFT epoch {epoch+1}/{self.epochs}",
+                    step,
+                    total_steps,
+                    total_loss / n_steps,
+                )
 
             # Handle remaining gradients
             if n_steps % self.grad_accum != 0:
@@ -317,6 +359,7 @@ class SFTTrainer:
         self.model.eval()
         total_loss = 0.0
         n = 0
+        total_steps = len(self.val_loader) if self.val_loader is not None else 0
         for batch in self.val_loader:  # type: ignore
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
@@ -329,6 +372,7 @@ class SFTTrainer:
             )
             total_loss += outputs["loss"].item()
             n += 1
+            self._log_step("SFT validation", n, total_steps, total_loss / n)
         return total_loss / max(n, 1)
 
     def _save(self, epoch: int, tag: str) -> None:

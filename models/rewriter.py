@@ -27,12 +27,15 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from huggingface_hub import snapshot_download
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+
+from models.prompting import format_sft_prompt
 
 
 class QueryRewriter(nn.Module):
@@ -63,18 +66,21 @@ class QueryRewriter(nn.Module):
         lora_dropout: float = 0.05,
         target_modules: Optional[List[str]] = None,
         load_in_8bit: bool = False,
+        torch_dtype: str = "auto",
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.base_model_name = base_model_name
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        model_source = self._resolve_model_source(base_model_name)
 
         if target_modules is None:
             target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
         # Load tokenizer
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
-            base_model_name,
+            model_source,
             trust_remote_code=True,
             padding_side="left",
         )
@@ -82,17 +88,28 @@ class QueryRewriter(nn.Module):
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        resolved_dtype = self._resolve_torch_dtype(torch_dtype)
+
         # Load base model
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
-            "torch_dtype": torch.float32,
+            "torch_dtype": resolved_dtype,
+            # "torch_type": torch.bfloat16
+            "low_cpu_mem_usage": True,
         }
+        if torch.cuda.is_available():
+            model_kwargs["attn_implementation"] = "sdpa"
         if load_in_8bit:
             model_kwargs["load_in_8bit"] = True
 
         base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name, **model_kwargs
+            model_source, **model_kwargs
         )
+        if gradient_checkpointing:
+            base_model.config.use_cache = False
+            base_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         # Apply LoRA
         lora_config = LoraConfig(
@@ -104,7 +121,40 @@ class QueryRewriter(nn.Module):
             bias="none",
         )
         self.model = get_peft_model(base_model, lora_config)
+        if gradient_checkpointing and hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
         self._print_trainable_params()
+
+    @staticmethod
+    def _resolve_model_source(base_model_name: str) -> str:
+        try:
+            cached_snapshot = snapshot_download(base_model_name, local_files_only=True)
+        except Exception:
+            return base_model_name
+
+        print(f"  Using cached model snapshot: {cached_snapshot}")
+        return cached_snapshot
+
+    @staticmethod
+    def _resolve_torch_dtype(torch_dtype: str) -> torch.dtype:
+        if torch_dtype == "auto":
+            if torch.cuda.is_available():
+                if torch.cuda.is_bf16_supported():
+                    return torch.bfloat16
+                return torch.float16
+            return torch.float32
+
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        if torch_dtype not in dtype_map:
+            raise ValueError(
+                f"Unsupported torch_dtype={torch_dtype!r}. "
+                "Use one of: auto, float32, float16, bfloat16."
+            )
+        return dtype_map[torch_dtype]
 
     def _print_trainable_params(self) -> None:
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -180,8 +230,6 @@ class QueryRewriter(nn.Module):
         -------
         list[str] — Rewritten queries.
         """
-        from data.MS_MARCO.build_preference_data import format_sft_prompt
-
         if device is None:
             device = next(self.model.parameters()).device.type
 

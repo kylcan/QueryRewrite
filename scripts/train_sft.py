@@ -37,7 +37,8 @@ def _load_jsonl(path: str):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SFT training for query rewriter")
-    parser.add_argument("--dataset", default="data/MS_MARCO/sft_dataset.jsonl")
+    parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--dataset", default="data/MS_MARCO/15k/sft_dataset.jsonl")
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -45,8 +46,20 @@ def main() -> None:
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--torch_dtype",
+        default="auto",
+        choices=["auto", "float32", "float16", "bfloat16"],
+        help="Model loading dtype. Use auto for GPU-friendly defaults.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce activation memory.",
+    )
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--gradient_accumulation", type=int, default=4)
+    parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--checkpoint_dir", default="checkpoints/sft")
@@ -77,6 +90,8 @@ def main() -> None:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        torch_dtype=args.torch_dtype,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     # Train/val split
@@ -111,6 +126,7 @@ def main() -> None:
         checkpoint_dir=args.checkpoint_dir,
         scheduler_type=args.scheduler,
         deepspeed_config=args.deepspeed,
+        log_every_steps=args.log_every,
     )
 
     history = trainer.train()

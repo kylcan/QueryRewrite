@@ -61,6 +61,14 @@ def main() -> None:
         help="Path to DeepSpeed JSON config (e.g. configs/deepspeed_zero3.json). "
              "Launch with: deepspeed --num_gpus N scripts/train_dpo.py --deepspeed ...",
     )
+    parser.add_argument(
+        "--precompute_ref_logps",
+        action="store_true",
+        help=(
+            "Pre-compute frozen reference-model log-probs before training to save GPU memory. "
+            "Recommended for 7B DPO on limited-VRAM GPUs."
+        ),
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -113,6 +121,7 @@ def main() -> None:
 
     if args.deepspeed:
         print(f"  DeepSpeed config: {args.deepspeed}")
+    print(f"    Precompute ref logps: {args.precompute_ref_logps}")
 
     trainer = DPOTrainer(
         model=model,
@@ -128,6 +137,7 @@ def main() -> None:
         device=device,
         checkpoint_dir=args.checkpoint_dir,
         deepspeed_config=args.deepspeed,
+        precompute_ref_log_probs=args.precompute_ref_logps,
     )
 
     history = trainer.train()

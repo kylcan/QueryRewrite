@@ -170,14 +170,10 @@ def _expand_vocabulary(query: str) -> str:
 
 
 def rule_based_rewrite(query: str) -> str:
-    """Intent-aware query rewrite with vocabulary expansion.
+    """Minimal rewrite fallback.
 
-    1. Classify query intent (definition / procedural / factual / yesno /
-       comparison / general).
-    2. Apply an intent-specific structural transform that converts the
-       question form into a declarative/noun-phrase form closer to how
-       answer passages are written.
-    3. Optionally expand vocabulary with a domain synonym.
+    Apply a light structural normalization only when it shortens or clarifies
+    the query.  Avoid keyword stuffing, synonym expansion, and meaning drift.
     """
     q = query.strip().rstrip("?").rstrip(".")
     intent = _classify_intent(query)
@@ -188,7 +184,7 @@ def rule_based_rewrite(query: str) -> str:
             r"^(what is|what are|what does|what do|define|meaning of)\s+",
             "", q, flags=re.IGNORECASE,
         ).strip()
-        q = f"{core} definition meaning"
+        q = f"{core} definition"
 
     elif intent == "procedural":
         # "how to X" → "steps method procedure X"
@@ -197,25 +193,25 @@ def rule_based_rewrite(query: str) -> str:
             r"how do|how can|how does|how should i|how should|steps to)\s+",
             "", q, flags=re.IGNORECASE,
         ).strip()
-        q = f"{core} steps method procedure"
+        q = core or q
 
     elif intent == "factual":
-        # "where is X" → "X location"  /  "when was X" → "X date year"
+        # Keep only the minimum retrieval-helpful cue.
         if re.match(r"^where\b", q, re.IGNORECASE):
             core = re.sub(r"^where\s+(is|are|was|were|do|does)?\s*",
                           "", q, flags=re.IGNORECASE).strip()
-            q = f"{core} location geography"
+            q = f"{core} location"
         elif re.match(r"^when\b", q, re.IGNORECASE):
             core = re.sub(r"^when\s+(is|are|was|were|did|do|does)?\s*",
                           "", q, flags=re.IGNORECASE).strip()
-            q = f"{core} date year time"
+            q = f"{core} date"
         elif re.match(r"^who\b", q, re.IGNORECASE):
             core = re.sub(r"^who\s+(is|are|was|were|did)?\s*",
                           "", q, flags=re.IGNORECASE).strip()
-            q = f"{core} person identity"
+            q = f"{core} person"
         elif re.match(r"^which\b", q, re.IGNORECASE):
             core = re.sub(r"^which\s+", "", q, flags=re.IGNORECASE).strip()
-            q = f"{core} specific type"
+            q = core or q
         else:
             # how many / how much / how long / how far / how old
             core = re.sub(
@@ -226,61 +222,56 @@ def rule_based_rewrite(query: str) -> str:
             measure = re.match(r"^(how many|how much|how long|how far|how old)",
                                q, re.IGNORECASE)
             suffix = {
-                "how many": "number count quantity",
-                "how much": "amount cost price",
-                "how long": "duration length time",
-                "how far": "distance range",
-                "how old": "age years",
-            }.get(measure.group(1).lower() if measure else "", "amount")
+                "how many": "count",
+                "how much": "amount",
+                "how long": "duration",
+                "how far": "distance",
+                "how old": "age",
+            }.get(measure.group(1).lower() if measure else "", "")
             q = f"{core} {suffix}"
 
     elif intent == "yesno":
-        # "is X Y" → "X Y explanation"
-        core = re.sub(
-            r"^(is|are|do|does|did|can|could|will|would|was|were|"
-            r"has|have|should)\s+",
-            "", q, flags=re.IGNORECASE,
-        ).strip()
-        q = f"{core} explanation"
+        # Preserve wording for factual yes/no queries.
+        q = q
 
     elif intent == "comparison":
-        # "X vs Y" → "comparison X and Y differences similarities"
+        # Normalize only the comparison marker.
         core = re.sub(
             r"\b(vs\.?|versus|compared? to)\b", "and",
             q, flags=re.IGNORECASE,
         ).strip()
-        q = f"comparison {core} differences similarities"
+        q = f"{core} comparison"
 
     else:
-        # General: extract as-is, append "information"
-        q = f"{q} information"
+        # General: leave already-clear queries unchanged.
+        q = q
 
-    # Vocabulary expansion (50% chance to add a synonym)
-    if random.random() < 0.5:
-        q = _expand_vocabulary(q)
-
-    return q
+    return " ".join(q.split()).strip() or query.strip()
 
 
-_LLM_SYSTEM_PROMPT = """You are a search query optimizer. Given a user query, rewrite it to better match the vocabulary of encyclopedia-style answer passages.
+_LLM_SYSTEM_PROMPT = """You are a search query optimizer. Rewrite the query ONLY if it would help retrieve a relevant passage. Make minimal changes.
 
 Rules:
-- Convert questions to declarative/noun-phrase form
-- Replace colloquial terms with formal equivalents
-- Add domain-specific synonyms that documents would use
-- Do NOT add generic filler words like "guide", "tips", "overview", "advice"
-- Keep the rewrite concise (under 15 words)
+- Preserve the original meaning exactly
+- Keep the rewrite as close to the original wording as possible
+- Convert questions into short noun-phrase or factual search form only when helpful
+- Expand abbreviations or replace slang only when it clearly improves retrieval
+- Do NOT add extra synonyms, keyword lists, or generic filler words
+- If the query is already clear and specific, return it unchanged
+- Keep the rewrite concise
 - Return ONLY the rewritten query, nothing else"""
 
 _LLM_FEW_SHOT = [
-    ("what is a conifer", "conifer definition evergreen cone-bearing tree"),
-    ("how long is a rugby match", "rugby match duration time length minutes"),
-    ("best tragedies of ancient greece", "greatest ancient Greek tragedies Sophocles Euripides"),
-    ("is mirin halal", "mirin halal status Islamic permissibility rice wine"),
-    ("where are precambrian rocks found", "precambrian rock locations geological distribution"),
-    ("what does mrna do", "mRNA function role protein synthesis translation"),
-    ("cost to treat termites", "termite treatment cost price extermination expense"),
-    ("salary for pvt in us army", "US army private salary pay compensation rank E-1"),
+    ("what is a conifer", "conifer definition"),
+    ("how long is a rugby match", "rugby match duration"),
+    ("best tragedies of ancient greece", "best tragedies of ancient greece"),
+    ("is mirin halal", "mirin halal status"),
+    ("where are precambrian rocks found", "precambrian rock locations"),
+    ("what does mrna do", "mRNA function"),
+    ("cost to treat termites", "termite treatment cost"),
+    ("salary for pvt in us army", "US Army private salary"),
+    ("weather today", "weather today"),
+    ("python list comprehension", "python list comprehension"),
 ]
 
 
@@ -290,9 +281,8 @@ def llm_rewrite(
 ) -> str:
     """Rewrite via LLM if available, else fall back to rules.
 
-    Uses an intent-aware few-shot prompt designed to produce
-    declarative, vocabulary-expanded rewrites that align with
-    encyclopedia-style answer passages.
+    Uses a few-shot prompt designed to prefer minimal edits and preserve
+    query meaning.  If the query is already retrieval-ready, keep it unchanged.
 
     Parameters
     ----------
@@ -313,7 +303,6 @@ def llm_rewrite(
         f"  Query: {q}\n  Rewrite: {r}" for q, r in _LLM_FEW_SHOT
     )
     prompt = (
-        f"{_LLM_SYSTEM_PROMPT}\n\n"
         f"Examples:\n{examples}\n\n"
         f"Query: {query}\nRewrite:"
     )

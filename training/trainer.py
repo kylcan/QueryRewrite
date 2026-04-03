@@ -1,193 +1,205 @@
-"""Main training loop orchestrator."""
+"""Train the query rewriter with DPO (Direct Preference Optimization).
+
+Starts from a SFT checkpoint and further aligns the rewriter using
+(prompt, chosen, rejected) preference pairs from dpo_dataset.jsonl.
+
+Usage::
+
+    python scripts/train_dpo.py
+    python scripts/train_dpo.py --sft_checkpoint checkpoints/sft/best
+    python scripts/train_dpo.py --beta 0.05 --epochs 2
+"""
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
 
 import torch
-from torch.utils.data import DataLoader
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from models.rewriter import QueryRewriter
+from training.dpo_trainer import DPODataset, DPOTrainer
 
 
-class Trainer:
-    """Handles the full training lifecycle: train, validate, checkpoint.
+def _load_jsonl(path: str):
+    records = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            records.append(json.loads(line))
+    return records
 
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The embedding model to train.
-    train_loader : DataLoader
-        Training data loader.
-    val_loader : DataLoader | None
-        Validation data loader (optional).
-    loss_fn : torch.nn.Module
-        Loss function (e.g. InfoNCE).
-    optimizer : torch.optim.Optimizer
-        Optimizer.
-    epochs : int
-        Number of training epochs.
-    scheduler : optional
-        Learning-rate scheduler (step per epoch).
-    device : str
-        Target device (``"cuda"`` or ``"cpu"``).
-    checkpoint_dir : str | Path
-        Directory to save model checkpoints.
-    """
 
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        train_loader: DataLoader,
-        loss_fn: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        epochs: int = 3,
-        val_loader: Optional[DataLoader] = None,
-        scheduler: Optional[Any] = None,
-        device: str = "cpu",
-        checkpoint_dir: str | Path = "checkpoints/alignment",
-    ) -> None:
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.loss_fn = loss_fn
-        self.optimizer = optimizer
-        self.epochs = epochs
-        self.scheduler = scheduler
-        self.device = device
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.best_val_loss = float("inf")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="DPO training for query rewriter")
+    parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--dataset", default="data/MS_MARCO/15k/dpo_dataset.jsonl")
+    parser.add_argument("--sft_checkpoint", default="checkpoints/sft/best",
+                        help="Path to the SFT adapter to start from")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--beta", type=float, default=0.1,
+                        help="DPO inverse temperature (lower = stronger preference)")
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--torch_dtype",
+        default="auto",
+        choices=["auto", "float32", "float16", "bfloat16"],
+        help="Model loading dtype. Use auto for GPU-friendly defaults.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce activation memory.",
+    )
+    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--gradient_accumulation", type=int, default=4)
+    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=500,
+        help="Save a resumable training checkpoint every N training steps. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the latest training checkpoint under checkpoint_dir/resume.",
+    )
+    parser.add_argument(
+        "--ref_device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Where to place the frozen DPO reference model. Use cpu to reduce GPU memory.",
+    )
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--checkpoint_dir", default="checkpoints/dpo")
+    parser.add_argument("--scheduler", default="cosine", choices=["linear", "cosine"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--deepspeed", default=None, metavar="DS_CONFIG",
+        help="Path to DeepSpeed JSON config (e.g. configs/deepspeed_zero3.json). "
+             "Launch with: deepspeed --num_gpus N scripts/train_dpo.py --deepspeed ...",
+    )
+    parser.add_argument(
+        "--precompute_ref_logps",
+        action="store_true",
+        help="Pre-compute ref model log-probs before training to save GPU memory. "
+             "Essential for 7B DPO on limited VRAM (e.g. 2-3× RTX 4090).",
+    )
+    args = parser.parse_args()
 
-    def train(self) -> Dict[str, float]:
-        """Run the full training loop.
-
-        Returns
-        -------
-        dict[str, float]
-            Final training metrics.
-        """
-        history: Dict[str, float] = {}
-        for epoch in range(self.epochs):
-            train_loss = self._train_epoch(epoch)
-            print(f"  Epoch {epoch+1}/{self.epochs}  train_loss={train_loss:.4f}", end="")
-
-            if self.val_loader is not None:
-                val_metrics = self._validate()
-                val_loss = val_metrics["val_loss"]
-                print(f"  val_loss={val_loss:.4f}", end="")
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.save_checkpoint(self.checkpoint_dir / "best", epoch)
-                    print("  ★ saved best", end="")
-            else:
-                self.save_checkpoint(self.checkpoint_dir / "best", epoch)
-
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-            print()
-            history[f"epoch_{epoch+1}_train_loss"] = train_loss
-
-        return history
-
-    def _train_epoch(self, epoch: int) -> float:
-        """Train for a single epoch.
-
-        Returns
-        -------
-        float
-            Average training loss for this epoch.
-        """
-        self.model.train()
-        total_loss = 0.0
-        n_batches = 0
-
-        for batch in self.train_loader:
-            q_emb = self.model(
-                batch["query_input_ids"].to(self.device),
-                batch["query_attention_mask"].to(self.device),
-            )
-            p_emb = self.model(
-                batch["pos_input_ids"].to(self.device),
-                batch["pos_attention_mask"].to(self.device),
-            )
-            n_emb = self.model(
-                batch["neg_input_ids"].to(self.device),
-                batch["neg_attention_mask"].to(self.device),
-            )
-
-            loss = self.loss_fn(q_emb, p_emb, n_emb)
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            n_batches += 1
-
-        return total_loss / max(n_batches, 1)
-
-    @torch.no_grad()
-    def _validate(self) -> Dict[str, float]:
-        """Run validation and return metrics."""
-        self.model.eval()
-        total_loss = 0.0
-        n_batches = 0
-
-        for batch in self.val_loader:  # type: ignore[union-attr]
-            q_emb = self.model(
-                batch["query_input_ids"].to(self.device),
-                batch["query_attention_mask"].to(self.device),
-            )
-            p_emb = self.model(
-                batch["pos_input_ids"].to(self.device),
-                batch["pos_attention_mask"].to(self.device),
-            )
-            n_emb = self.model(
-                batch["neg_input_ids"].to(self.device),
-                batch["neg_attention_mask"].to(self.device),
-            )
-            loss = self.loss_fn(q_emb, p_emb, n_emb)
-            total_loss += loss.item()
-            n_batches += 1
-
-        return {"val_loss": total_loss / max(n_batches, 1)}
-
-    def save_checkpoint(self, path: str | Path, epoch: int) -> None:
-        """Persist model state.
-
-        Parameters
-        ----------
-        path : str | Path
-            Checkpoint directory.
-        epoch : int
-            Current epoch.
-        """
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-            },
-            path / "checkpoint.pt",
+    if args.deepspeed and args.gradient_checkpointing:
+        print(
+            "  Warning: disabling gradient checkpointing because "
+            "Qwen + DeepSpeed can trigger torch.utils.checkpoint.CheckpointError "
+            "in this environment."
         )
+        args.gradient_checkpointing = False
 
-    def load_checkpoint(self, path: str | Path) -> int:
-        """Restore training state from a checkpoint.
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available() and args.local_rank >= 0:
+        torch.cuda.set_device(args.local_rank)
+        device = f"cuda:{args.local_rank}"
+    else:
+        device = "mps" if torch.backends.mps.is_available() else (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    print(f"Device: {device}")
 
-        Parameters
-        ----------
-        path : str | Path
-            Checkpoint directory.
+    # Load data
+    print(f"\n  Loading DPO data from {args.dataset} …")
+    records = _load_jsonl(args.dataset)
+    print(f"  Total preference pairs: {len(records)}")
 
-        Returns
-        -------
-        int
-            The epoch to resume from.
-        """
-        ckpt = torch.load(Path(path) / "checkpoint.pt", map_location=self.device, weights_only=True)
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        return ckpt["epoch"]
+    # Load SFT-trained model
+    print(f"\n  Loading base model: {args.model}")
+    model = QueryRewriter(
+        base_model_name=args.model,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        torch_dtype=args.torch_dtype,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+
+    sft_path = Path(args.sft_checkpoint)
+    if sft_path.exists():
+        print(f"  Loading SFT adapter from {sft_path}")
+        model.load_adapter(str(sft_path))
+    else:
+        print(f"  ⚠ SFT checkpoint not found at {sft_path}, training from base model")
+
+    # Create reference model (frozen copy)
+    print("  Creating frozen reference model …")
+    ref_model = model.get_ref_model()
+
+    # Train/val split
+    n_val = int(len(records) * args.val_ratio)
+    val_records = records[:n_val] if n_val > 0 else None
+    train_records = records[n_val:]
+    print(f"  Train: {len(train_records)}, Val: {n_val}")
+
+    train_dataset = DPODataset(train_records, model.tokenizer, max_length=args.max_length)
+    val_dataset = DPODataset(val_records, model.tokenizer, max_length=args.max_length) if val_records else None
+
+    # Train
+    print(f"\n  Config:")
+    print(f"    LR: {args.lr}")
+    print(f"    Beta: {args.beta}")
+    print(f"    Batch: {args.batch_size} × {args.gradient_accumulation} accum")
+    print(f"    LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}")
+    print(f"    Scheduler: {args.scheduler}")
+    print(f"    Ref model device: {args.ref_device}")
+    print(f"    Save every: {args.save_every}")
+    print(f"    Resume: {args.resume}")
+
+    if args.deepspeed:
+        print(f"  DeepSpeed config: {args.deepspeed}")
+
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        beta=args.beta,
+        warmup_ratio=args.warmup_ratio,
+        gradient_accumulation_steps=args.gradient_accumulation,
+        device=device,
+        checkpoint_dir=args.checkpoint_dir,
+        deepspeed_config=args.deepspeed,
+        log_every_steps=args.log_every,
+        ref_model_device=args.ref_device,
+        precompute_ref_log_probs=args.precompute_ref_logps,
+        save_every_steps=args.save_every,
+        seed=args.seed,
+        resume=args.resume,
+    )
+
+    history = trainer.train()
+    print(f"\n  DPO training complete. Adapter saved to {args.checkpoint_dir}/best")
+
+    # Quick inference test
+    print("\n  ── Quick inference test ──")
+    test_queries = ["what is rba", "how to install python"]
+    rewrites = model.rewrite_queries(test_queries, device=device)
+    for q, r in zip(test_queries, rewrites):
+        print(f"  Q: {q}")
+        print(f"  R: {r}\n")
+
+
+if __name__ == "__main__":
+    main()
