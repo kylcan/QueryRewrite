@@ -10,3 +10,7 @@ __pycache__/
 data/
 *.pt
 *.jsonl
+checkpoints/
+data/
+*.pt
+*.jsonl
